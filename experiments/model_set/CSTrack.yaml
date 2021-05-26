@@ -1,8 +1,8 @@
 # parameters
 nc: 1  # number of classes
 id_embedding: 512
-depth_multiple: 1.0  # model depth multiple
-width_multiple: 1.0  # layer channel multiple
+depth_multiple: 0.67 #0.33/0.67/1.0  # model depth multiple
+width_multiple: 0.75 #0.50/0.75/1.0  # layer channel multiple
 
 # anchors
 anchors:
@@ -47,7 +47,7 @@ head:
 
    [17, 1, CCN, [9,256]],  # CCN
    [20, 1, CCN, [9,512]],  # CCN
-   [23, 1, CCN, [9,1024]],  # CCN
+   [23, 1, CCN, [9,1024]], # CCN
    [[24,25,26], 1, SAAN, [id_embedding]],  # SAAN
    [[24,25,26], 1, Detect, [nc, anchors, 0]],  # Detect(P3, P4, P5)
   ]

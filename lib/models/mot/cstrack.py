@@ -186,6 +186,7 @@ class CCN(nn.Module):
         w = 6
         h = 10
         self.avg_pool = nn.AdaptiveAvgPool2d((w,h))
+        print("[CCN]k_size:",k_size,",ch:",ch)
 
         self.c_attention1 = nn.Sequential(nn.Conv2d(ch, ch, kernel_size=3, stride=1, padding=1, bias=True),
                                           nn.InstanceNorm2d(num_features=ch),
@@ -263,6 +264,7 @@ class Model(nn.Module):
         m = self.model[-1]  # Detect()
         if isinstance(m, Detect):
             s = 128  # 2x min stride
+            print("[Model]torch.zeros(2,",ch,s,s,")")
             x = self.forward(torch.zeros(2, ch, s, s))
             m.stride = torch.tensor([s / x.shape[-2] for x in x[-1][0]])  # forward
             m.anchors /= m.stride.view(-1, 1, 1)
@@ -315,6 +317,7 @@ class Model(nn.Module):
                 dt.append((time_synchronized() - t) * 100)
                 print('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt[-1], m.type))
 
+            #print("[forward_once]m:",m)
             x = m(x)  # run
             if m.i in self.out:
                 output.append(x)
@@ -329,8 +332,9 @@ class Model(nn.Module):
         m = self.model[-1]  # Detect() module
         for mi, s in zip(m.m, m.stride):  # from
             b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
-            b[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
-            b[:, 5:] += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
+            with torch.no_grad():
+               b[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
+               b[:, 5:] += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
             mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
 
     def _print_biases(self):
@@ -419,7 +423,13 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         elif m is DenseMask:
             out_list += [i]
             args.append([ch[x + 1] for x in f])
+        elif m is CCN:
+            c1 = make_divisible(args[1] * gw, 8)
+            c2 = ch[f]
+            print("[parse_model]else m:",m,"n:",n,"c1:",c1,"c2:",c2,"f:",f,"ch[f]:",ch[f],",args:",args)
+            args[1] = c1
         else:
+            print("[parse_model]else m:",m,"n:",n,"c2:",c2,"f:",f,"ch[f]:",ch[f],",args:",args)
             c2 = ch[f]
 
         m_ = nn.Sequential(*[m(*args) for _ in range(n)]) if n > 1 else m(*args)  # module

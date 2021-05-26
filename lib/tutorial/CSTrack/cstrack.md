@@ -1,3 +1,7 @@
+# Update
+
+I've made change in cstrack.py to make CSTrack work well with yolov5l and yolov5m and yolov5s, you only need to change the paramters depth_multiple and width_multiple in https://github.com/BrightDotAi/SOTS/blob/master/experiments/model_set/CSTrack.yaml  [Arnold]
+
 # CSTrack tutorial
 
 We assume the root path is $SOTS, e.g. `/home/chaoliang/SOTS`

@@ -30,6 +30,54 @@ class Detect(nn.Module):
         a = torch.tensor(anchors).float().view(self.nl, -1, 2)
         self.register_buffer('anchors', a)  # shape(nl,na,2)
         self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
+        self.m = nn.ModuleList([nn.Conv2d(ch[0], (self.no) * self.na, 1),
+                               nn.Conv2d(ch[1], (self.no) * self.na, 1),
+                               nn.Conv2d(ch[2], (self.no) * self.na, 1)])  # output conv
+        self.export = False  # onnx export
+        self.k = Parameter(torch.ones(1) * 10)
+
+    def forward(self, x):
+        # x = x.copy()  # for profiling
+        z = []  # inference output
+        self.training |= self.export
+        #print("[Detect.forward()]nl:",self.nl)
+        for i in range(self.nl):
+            x[i] = self.m[i](x[i])  # conv
+            bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
+            x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+            if not self.training:  # inference
+                if self.grid[i].shape[2:4] != x[i].shape[2:4]:
+                    self.grid[i] = self._make_grid(nx, ny).to(x[i].device)
+
+                y = x[i].sigmoid()
+                if self.k[0] == 10:
+                    y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i].to(x[i].device)) * self.stride[i]  # xy
+                else:
+                    y[..., 0:2] = ((y[..., 0:2] - 0.5) * self.k + self.grid[i].to(x[i].device)) * self.stride[i]  # xy
+                y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                y = y[..., :6]
+                z.append(y.view(bs, -1, self.no))
+
+        return [x,self.k] if self.training else (torch.cat(z, 1), [x,self.k])
+
+    @staticmethod
+    def _make_grid(nx=20, ny=20):
+        yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
+        return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
+
+class CSTrack_Detect(nn.Module):
+    def __init__(self, nc=80, anchors=(), id_embedding=256, ch=()):  # detection layer
+        super(CSTrack_Detect, self).__init__()
+        self.stride = None  # strides computed during build
+        self.nc = nc  # number of classes
+        self.no = nc + 5  # number of outputs per anchor
+        self.nl = len(anchors)  # number of detection layers
+        self.na = len(anchors[0]) // 2  # number of anchors
+        self.id_embedding = id_embedding
+        self.grid = [torch.zeros(1)] * self.nl  # init grid
+        a = torch.tensor(anchors).float().view(self.nl, -1, 2)
+        self.register_buffer('anchors', a)  # shape(nl,na,2)
+        self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
         self.m = nn.ModuleList([nn.Conv2d(ch[0]//2, (self.no) * self.na, 1),
                                nn.Conv2d(ch[1], (self.no) * self.na, 1),
                                nn.Conv2d(ch[2], (self.no) * self.na, 1)])  # output conv
@@ -40,6 +88,7 @@ class Detect(nn.Module):
         # x = x.copy()  # for profiling
         z = []  # inference output
         self.training |= self.export
+        print("[Detect.forward()]nl:",self.nl)
         for i in range(self.nl):
             x[i] = self.m[i](x[i][0])  # conv
             #x[i] = self.m[i](x[i])  # conv
@@ -82,6 +131,34 @@ class DenseMask(nn.Module):
     def forward(self, layers):
         return self.sigmoid(self.proj1(layers[0][0])+self.proj2(layers[1][0])+self.proj3(layers[2][0]))
 
+class JDE(nn.Module):
+    def __init__(self,id_embedding=256,ch=()):
+        super(JDE,self).__init__()
+        self.proj1 = Conv(ch[0], 256, k=3)
+        self.proj2 = nn.Sequential(Conv(ch[1], 256, k=3),
+                                   nn.ConvTranspose2d(256, 256, 4, stride=2,padding=1, 
+                                     output_padding=0,groups=256, bias=False))
+        self.proj3 = nn.Sequential(Conv(ch[2], 256, k=3),
+                                   nn.ConvTranspose2d(256, 256, 8, stride=4,padding=2, 
+                                     output_padding=0,groups=256, bias=False))
+        self.node = nn.Sequential(Conv(256 * 3, 256,k=3),
+                                  nn.Conv2d(256,id_embedding,kernel_size=1, stride=1,
+                                                        padding=0, bias=True))
+
+    def forward(self, layers):
+        #print("[JDE]layers shape:",len(layers))
+        #print("[JDE]input shape:",layers[0].size())
+        y_8 = self.proj1(layers[0])
+        y_16 = self.proj2(layers[1])
+        y_32 = self.proj3(layers[2])
+        cat6 = torch.cat([y_8,y_16,y_32],1)
+        #print("[JDE]cat6 shape:",cat6.size())
+        x = self.node(cat6)
+        #print("[JDE]before permute shape:",x.size())
+        x = x.permute(0,2,3,1).contiguous()
+        #print("[JDE]after permute shape:",x.size())
+        return x
+
 class SAAN(nn.Module):
     def __init__(self,id_embedding=256,ch=()):
         super(SAAN, self).__init__()
@@ -106,14 +183,24 @@ class SAAN(nn.Module):
                                   )
 
     def forward(self, layers):
+        '''        
+        num = len(layers)
+        for i in range(0,num):
+          b1,c1,h1,w1 = 0,0,0,0 #layers[i][0].size()
+          b2,c2,h2,w2 = layers[i][1].size()
+          print("[SAAN.forward()]i:",i,",b1,c1,h1,w1:",b1,c1,h1,w1,",b2,c2,h2,w2:",b2,c2,h2,w2)
+        '''
         layers[0] = self.proj1(layers[0][1])
         layers[1] = self.proj2(layers[1][1])
         layers[2] = self.proj3(layers[2][1])
         #layers[0] = self.proj1(layers[0])
         #layers[1] = self.proj2(layers[1])
         #layers[2] = self.proj3(layers[2])
+        #print("[SAAN.forward()]layers size:",layers[0].size(),layers[1].size(),layers[2].size())
         id_layer_out = self.node(torch.cat([layers[0], layers[1], layers[2]], 1))
+        #print("[SAAN.forward()]before permute size:",id_layer_out.size())
         id_layer_out = id_layer_out.permute(0, 2, 3, 1).contiguous()
+        #print("[SAAN.forward()]after permute size:",id_layer_out.size())
         return id_layer_out
 
 
@@ -186,15 +273,15 @@ class CCN(nn.Module):
         w = 6
         h = 10
         self.avg_pool = nn.AdaptiveAvgPool2d((w,h))
-        print("[CCN]k_size:",k_size,",ch:",ch)
+        #print("[CCN]k_size:",k_size,",ch:",ch)
 
+        
         self.c_attention1 = nn.Sequential(nn.Conv2d(ch, ch, kernel_size=3, stride=1, padding=1, bias=True),
                                           nn.InstanceNorm2d(num_features=ch),
                                           nn.LeakyReLU(0.3, inplace=True))
         self.c_attention2 = nn.Sequential(nn.Conv2d(ch, ch, kernel_size=3, stride=1, padding=1, bias=True),
                                           nn.InstanceNorm2d(num_features=ch),
                                           nn.LeakyReLU(0.3, inplace=True))
-
 
         self.sigmoid = nn.Sigmoid()
         #self.conv1 = Conv(ch, ch, k=1)
@@ -203,7 +290,7 @@ class CCN(nn.Module):
     def forward(self, x):
         # x: input features with shape [b, c, h, w]
         b, c, h, w = x.size()
-
+        #print("[CCN.forward]b,c,h,w:",b,c,h,w)
         # feature descriptor on the global spatial information
         y = self.avg_pool(x)
 
@@ -238,6 +325,11 @@ class CCN(nn.Module):
         #print("M_t1",torch.sort(M_t1[0][0]))
         #print("y_t1",torch.max(y_t1),torch.min(y_t1))
         #print("y_t2", torch.max(y_t2), torch.min(y_t2))
+        '''
+        b1,c1,h1,w1 = x_t1.size()
+        b2,c2,h2,w2 = x_t2.size()
+        print("[CCN.forward]x_t1 b1,c1,h1,w1:",b1,c1,h1,w1,",x_t2 b2,c2,h2,w2:",b2,c2,h2,w2)
+        '''
         return [x_t1+x,x_t2+x]
 
 
@@ -262,7 +354,7 @@ class Model(nn.Module):
 
         # Build strides, anchors
         m = self.model[-1]  # Detect()
-        if isinstance(m, Detect):
+        if isinstance(m, Detect) or isinstance(m, CSTrack_Detect):
             s = 128  # 2x min stride
             print("[Model]torch.zeros(2,",ch,s,s,")")
             x = self.forward(torch.zeros(2, ch, s, s))
@@ -412,12 +504,12 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum([ch[-1 if x == -1 else x + 1] for x in f])
-        elif m is Detect:
+        elif m is Detect or  m is CSTrack_Detect:
             args.append([ch[x + 1] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)
             out_list += [i]
-        elif m is SAAN:
+        elif m is SAAN or m is JDE:
             out_list += [i]
             args.append([ch[x + 1] for x in f])
         elif m is DenseMask:
@@ -426,10 +518,10 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         elif m is CCN:
             c1 = make_divisible(args[1] * gw, 8)
             c2 = ch[f]
-            print("[parse_model]else m:",m,"n:",n,"c1:",c1,"c2:",c2,"f:",f,"ch[f]:",ch[f],",args:",args)
+            #print("[parse_model]else m:",m,"n:",n,"c1:",c1,"c2:",c2,"f:",f,"ch[f]:",ch[f],",args:",args)
             args[1] = c1
         else:
-            print("[parse_model]else m:",m,"n:",n,"c2:",c2,"f:",f,"ch[f]:",ch[f],",args:",args)
+            #print("[parse_model]else m:",m,"n:",n,"c2:",c2,"f:",f,"ch[f]:",ch[f],",args:",args)
             c2 = ch[f]
 
         m_ = nn.Sequential(*[m(*args) for _ in range(n)]) if n > 1 else m(*args)  # module

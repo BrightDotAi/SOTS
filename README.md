@@ -1,3 +1,9 @@
+# Notes
+
+For how to use CSTrack, please see https://github.com/BrightDotAi/SOTS/blob/master/lib/tutorial/CSTrack/cstrack.md
+
+
+============================================================================================
 # Single/Multiple Object Tracking and Segmentation
 
 ### Codes and comparison of recent single/multiple object tracking and segmentation.
